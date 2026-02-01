@@ -318,18 +318,59 @@ def solve_monte_carlo_optimization():
 
 
 if __name__ == "__main__":
-    # 基础分析
-    solve_q1()
-    solve_q2()
-    solve_q3()
-    baseline_env, tax_sensitivity = solve_q4()
+    import sys
     
-    # 可视化
-    solve_visualize()
-    solve_time_constraint_analysis()
-    solve_elevator_physics_analysis()
-    
-    # 🔴 蒙特卡洛优化（1000次迭代）
-    #solve_monte_carlo_optimization()
+    # Check for command-line argument to run specific analysis
+    if len(sys.argv) > 1:
+        if sys.argv[1] == "monte_carlo":
+            # Run only Monte Carlo optimization
+            print("Running Monte Carlo Optimization...")
+            solve_monte_carlo_optimization()
+        elif sys.argv[1] == "plots":
+            # Run only plotting/visualization
+            print("Running Visualization Suite...")
+            solve_visualize()
+            solve_time_constraint_analysis()
+            solve_elevator_physics_analysis()
+        elif sys.argv[1] == "q4":
+            # Run only Q4 environmental analysis
+            print("Running Q4 Environmental Analysis...")
+            baseline_env, tax_sensitivity = solve_q4()
+        elif sys.argv[1] == "full":
+            # Run full analysis suite
+            print("Running Full Analysis Suite...")
+            solve_q1()
+            solve_q2()
+            solve_q3()
+            baseline_env, tax_sensitivity = solve_q4()
+            solve_visualize()
+            solve_time_constraint_analysis()
+            solve_elevator_physics_analysis()
+            solve_monte_carlo_optimization()
+        else:
+            print("Unknown command. Available commands:")
+            print("  python main.py monte_carlo  - Run Monte Carlo optimization")
+            print("  python main.py plots        - Run visualization suite")
+            print("  python main.py q4           - Run Q4 environmental analysis")
+            print("  python main.py full         - Run full analysis suite")
+            print("  python main.py              - Run standard analysis (Q1-Q4 + visualizations)")
+    else:
+        # Default: run standard analysis (not including Monte Carlo to save time)
+        print("Running Standard Analysis Suite (use 'python main.py full' for complete analysis)...")
+        solve_q1()
+        solve_q2()
+        solve_q3()
+        baseline_env, tax_sensitivity = solve_q4()
+        
+        # Visualizations
+        solve_visualize()
+        solve_time_constraint_analysis()
+        solve_elevator_physics_analysis()
+        
+        print("\n" + "=" * 80)
+        print("✅ Standard analysis complete!")
+        print("To run Monte Carlo optimization: python main.py monte_carlo")
+        print("=" * 80)
+
 
    
