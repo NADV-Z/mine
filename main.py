@@ -68,8 +68,12 @@ def solve_q4():
     
     ctx_baseline = SimulationContext()
     ctx_baseline.is_stochastic = False
+    ctx_baseline.enable_environment = True  # ✅ Master switch
     ctx_baseline.calc_environmental_impact = True
     ctx_baseline.use_progressive_tax = False  # 不使用环境税
+    
+    # Note: For Scenario C, we need use_monte_carlo_env for env calculations
+    # But since we're not using tax here, we skip it for now
     
     sim_baseline = Simulator(ctx_baseline)
     
@@ -126,6 +130,8 @@ def solve_q4():
         
         ctx_tax = SimulationContext()
         ctx_tax.is_stochastic = False
+        ctx_tax.enable_environment = True  # ✅ Master switch
+        ctx_tax.use_monte_carlo_env = True  # ✅ Required for Scenario C env tax
         ctx_tax.calc_environmental_impact = True
         
         if multiplier == 0:
@@ -139,9 +145,9 @@ def solve_q4():
         result = sim_tax.run('C')
         
         # 统计环境税
-        total_env_cost = sum(h.get('env_cost', 0) for h in result.history)
         total_tax_atm = sum(h.get('tax_atm', 0) for h in result.history)
         total_tax_orb = sum(h.get('tax_orb', 0) for h in result.history)
+        total_env_cost = total_tax_atm + total_tax_orb  # Total environmental tax
         
         tax_results.append({
             'multiplier': multiplier,
@@ -318,18 +324,59 @@ def solve_monte_carlo_optimization():
 
 
 if __name__ == "__main__":
-    # 基础分析
-    solve_q1()
-    solve_q2()
-    solve_q3()
-    baseline_env, tax_sensitivity = solve_q4()
+    import sys
     
-    # 可视化
-    solve_visualize()
-    solve_time_constraint_analysis()
-    solve_elevator_physics_analysis()
-    
-    # 🔴 蒙特卡洛优化（1000次迭代）
-    #solve_monte_carlo_optimization()
+    # Check for command-line argument to run specific analysis
+    if len(sys.argv) > 1:
+        if sys.argv[1] == "monte_carlo":
+            # Run only Monte Carlo optimization
+            print("Running Monte Carlo Optimization...")
+            solve_monte_carlo_optimization()
+        elif sys.argv[1] == "plots":
+            # Run only plotting/visualization
+            print("Running Visualization Suite...")
+            solve_visualize()
+            solve_time_constraint_analysis()
+            solve_elevator_physics_analysis()
+        elif sys.argv[1] == "q4":
+            # Run only Q4 environmental analysis
+            print("Running Q4 Environmental Analysis...")
+            baseline_env, tax_sensitivity = solve_q4()
+        elif sys.argv[1] == "full":
+            # Run full analysis suite
+            print("Running Full Analysis Suite...")
+            solve_q1()
+            solve_q2()
+            solve_q3()
+            baseline_env, tax_sensitivity = solve_q4()
+            solve_visualize()
+            solve_time_constraint_analysis()
+            solve_elevator_physics_analysis()
+            solve_monte_carlo_optimization()
+        else:
+            print("Unknown command. Available commands:")
+            print("  python main.py monte_carlo  - Run Monte Carlo optimization")
+            print("  python main.py plots        - Run visualization suite")
+            print("  python main.py q4           - Run Q4 environmental analysis")
+            print("  python main.py full         - Run full analysis suite")
+            print("  python main.py              - Run standard analysis (Q1-Q4 + visualizations)")
+    else:
+        # Default: run standard analysis (not including Monte Carlo to save time)
+        print("Running Standard Analysis Suite (use 'python main.py full' for complete analysis)...")
+        solve_q1()
+        solve_q2()
+        solve_q3()
+        baseline_env, tax_sensitivity = solve_q4()
+        
+        # Visualizations
+        solve_visualize()
+        solve_time_constraint_analysis()
+        solve_elevator_physics_analysis()
+        
+        print("\n" + "=" * 80)
+        print("✅ Standard analysis complete!")
+        print("To run Monte Carlo optimization: python main.py monte_carlo")
+        print("=" * 80)
+
 
    
