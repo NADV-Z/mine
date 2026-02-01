@@ -13,17 +13,20 @@ def solve_monte_carlo_parallel():
     Run Monte Carlo optimization for different beta values (elevator ratio in Scenario C).
     
     Tests beta values: [0.5, 0.6, 0.7, 0.8, 0.9]
-    For each beta, runs Monte Carlo with environmental tax enabled (runs=100)
+    For each beta, runs Monte Carlo with environmental tax enabled
     
     Returns:
         summary_df: DataFrame with results for each beta
         optimal: dict with best beta configuration
         variance_stats: dict with variance statistics
     """
+    # Configuration
+    MONTE_CARLO_RUNS = 100  # Number of runs per beta value
+    
     print("\n" + "=" * 80)
     print("MONTE CARLO BETA OPTIMIZATION")
     print("=" * 80)
-    print(f"Runs per beta: 100")
+    print(f"Runs per beta: {MONTE_CARLO_RUNS}")
     print(f"Environmental tax: ENABLED")
     print("-" * 80)
     
@@ -38,7 +41,7 @@ def solve_monte_carlo_parallel():
         env_taxes = []
         durations = []
         
-        for run in range(100):
+        for run in range(MONTE_CARLO_RUNS):
             # Create context with environmental tax enabled
             ctx = SimulationContext()
             ctx.is_stochastic = True
@@ -140,36 +143,37 @@ def solve_monte_carlo_parallel():
     summary_df.to_csv(summary_filename, index=False)
     print(f"\n💾 Results saved to: {summary_filename}")
     
-    # Save detailed results
+    # Generate detailed history for optimal beta only (to save computation time)
+    print(f"\n📝 Generating detailed history for optimal beta = {optimal_beta['beta']:.1f}...")
     detailed_filename = f'monte_carlo_detailed_{timestamp}.csv'
     detailed_data = []
     
-    for beta in beta_values:
-        ctx = SimulationContext()
-        ctx.is_stochastic = False  # Single deterministic run for detailed history
-        ctx.enable_environment = True
-        ctx.calc_environmental_impact = True
-        ctx.use_progressive_tax = True
-        ctx.use_monte_carlo_env = True
-        ctx.env_tax_base = 1.0
-        ctx.beta_elevator_ratio = beta
-        
-        sim = Simulator(ctx)
-        result = sim.run('C')
-        
-        for h in result.history:
-            detailed_data.append({
-                'beta': beta,
-                'year': h['year'],
-                'rocket_launches': h.get('rocket_launches', 0),
-                'elevator_mass': h.get('elevator_mass', 0),
-                'cumulative_mass': h.get('cumulative_mass', 0),
-                'total_cost': h.get('total_cost', 0),
-                'S_env': h.get('S_env', 0),
-                'tax_atm': h.get('tax_atm', 0),
-                'tax_orb': h.get('tax_orb', 0),
-                'env_cost': h.get('tax_atm', 0) + h.get('tax_orb', 0)
-            })
+    # Run deterministic simulation for optimal beta only
+    ctx = SimulationContext()
+    ctx.is_stochastic = False
+    ctx.enable_environment = True
+    ctx.calc_environmental_impact = True
+    ctx.use_progressive_tax = True
+    ctx.use_monte_carlo_env = True
+    ctx.env_tax_base = 1.0
+    ctx.beta_elevator_ratio = optimal_beta['beta']
+    
+    sim = Simulator(ctx)
+    result = sim.run('C')
+    
+    for h in result.history:
+        detailed_data.append({
+            'beta': optimal_beta['beta'],
+            'year': h['year'],
+            'rocket_launches': h.get('rocket_launches', 0),
+            'elevator_mass': h.get('elevator_mass', 0),
+            'cumulative_mass': h.get('cumulative_mass', 0),
+            'total_cost': h.get('total_cost', 0),
+            'S_env': h.get('S_env', 0),
+            'tax_atm': h.get('tax_atm', 0),
+            'tax_orb': h.get('tax_orb', 0),
+            'env_cost': h.get('tax_atm', 0) + h.get('tax_orb', 0)
+        })
     
     detailed_df = pd.DataFrame(detailed_data)
     detailed_df.to_csv(detailed_filename, index=False)

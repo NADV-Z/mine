@@ -75,6 +75,9 @@ def plot_elevator_cost_breakdown():
     print("\n📊 Generating elevator cost breakdown...")
     
     # Cost allocation ratios during construction phase
+    # Based on typical space infrastructure projects where:
+    # - 70% goes to capital expenditure (materials, manufacturing, deployment)
+    # - 30% goes to operational costs (crew, maintenance, testing)
     CONSTRUCTION_COST_RATIO = 0.7  # CNT materials and reinforcement
     OPERATIONAL_COST_RATIO = 0.3   # Ongoing operations during build
     
