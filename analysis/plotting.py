@@ -74,6 +74,10 @@ def plot_elevator_cost_breakdown():
     """
     print("\n📊 Generating elevator cost breakdown...")
     
+    # Cost allocation ratios during construction phase
+    CONSTRUCTION_COST_RATIO = 0.7  # CNT materials and reinforcement
+    OPERATIONAL_COST_RATIO = 0.3   # Ongoing operations during build
+    
     # Run Scenario A (pure elevator)
     ctx = SimulationContext()
     ctx.is_stochastic = False
@@ -96,9 +100,9 @@ def plot_elevator_cost_breakdown():
             # During construction period
             total_year_cost = h.get('total_cost', 0)
             
-            # Rough estimate: construction is ~70% during build phase
-            construction_cost = total_year_cost * 0.7
-            operational_cost = total_year_cost * 0.3
+            # Estimate based on typical space elevator construction profile
+            construction_cost = total_year_cost * CONSTRUCTION_COST_RATIO
+            operational_cost = total_year_cost * OPERATIONAL_COST_RATIO
         else:
             # After construction
             construction_cost = 0
@@ -333,11 +337,13 @@ def plot_thickness_capacity_relationship():
     # Calculate thickness and capacity over reinforcement trips
     trips = np.arange(0, GlobalConfig.SE_REINFORCE_TRIPS_TOTAL + 1)
     
-    # Mass growth
+    # Mass growth with each reinforcement trip
     masses = GlobalConfig.SE_MASS_INIT_TONS * (1 + GlobalConfig.SE_GROWTH_RATE) ** trips
     
-    # Thickness estimation (assuming proportional to mass for fixed volume)
-    # thickness ∝ mass^(1/2) for a cylindrical structure
+    # Thickness estimation based on structural mechanics:
+    # For a cylindrical cable with fixed length and diameter, adding mass increases
+    # density/thickness. Assuming uniform reinforcement, thickness ∝ √mass
+    # This follows from: mass ∝ volume ∝ cross-sectional area ∝ thickness²
     thicknesses = GlobalConfig.SE_THICKNESS_INIT_M * np.sqrt(masses / GlobalConfig.SE_MASS_INIT_TONS)
     thicknesses_um = thicknesses * 1e6  # Convert to micrometers
     
