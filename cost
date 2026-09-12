@@ -1,0 +1,475 @@
+"""初始站补测 + 多频道剩余区域 + 联合行动滚动规划。
+依赖同目录 problem_3_optimized.py；运行说明见第三问联合策略说明.md。
+"""
+import argparse
+import dataclasses
+import itertools
+import json
+import math
+import time
+import uuid
+from pathlib import Path
+import os
+# 小矩阵几何任务避免BLAS线程启动/争用；尊重用户已有环境设置。
+for _name in ("OMP_NUM_THREADS","MKL_NUM_THREADS","OPENBLAS_NUM_THREADS"):
+    os.environ.setdefault(_name,"1")
+import numpy as np
+import problem_3_optimized as core
+
+@dataclasses.dataclass
+class Config(core.Config):
+    ring: float = 1150.
+    grid: int = 11
+    observations: int = 17
+    circle_sides: int = 32
+    scan_min_area: float = 400000.
+    score_limit: int = 48
+    decision_seconds: float = 80.
+    shared_detection: bool = True
+    shared_min_gain: float = .4
+    cost_model: str = 'B'       # baseline / A检测尾部 / B混合插入
+    tail_depth: int = 1         # 1或2次预测检测后再兜底
+    tail_candidates: int = 2    # 每源细评候选上限
+    insertion_passes: int = 1   # 保持同源先后约束的任务重插入轮数
+    initial_stations: int = 2
+    delta_rho: float = 5.        # 推荐检测半径容差(m)，不是清除安全裕量
+    recommendations: int = 3    # 每源保留分散候选数
+    joint_sources: int = 3      # 每轮精评的源数量，不限制原地补测频道数
+    joint_actions: int = 8      # 全局动作精评上限
+    station_seconds: float = 8. # 每站补测筛选计算软预算，不含动作时间
+    recommendation_seconds: float = 3. # 每源推荐计算软预算
+    joint_seconds: float = 10.  # 联合决策软计算预算
+
+class JointRobot(core.Robot):
+    def __init__(self,*args,**kwargs):
+        super().__init__(*args,**kwargs)
+        self.unsearched={c:core.target_region(self.cfg) for c in self.channels}
+        self.initial_seen=set()
+        self.recommendation_cache={}
+        self.sharing=False
+        self.coverage_cache={}
+        self.work_deadline=math.inf
+        self.negative_cache={}
+        self.coverage_channel_cache={}
+        self.tail_cache={}
+        self.cost_deadline=math.inf
+        self.tail_hits=0
+        self.tail_misses=0 
+
+    def refresh_coverage(self):
+        # 外包目标域减内接检测圆：空集是可靠排除，残余碎片不是源存在证明。
+        for c,ch in self.channels.items():
+            if ch.status!='unknown':continue
+            signature=tuple(tuple(p) for p in ch.negatives)
+            if self.negative_cache.get(c)==signature:continue
+            self.negative_cache[c]=signature
+            reg=core.target_region(self.cfg)
+            for p in ch.negatives:
+                reg=reg.subtract_disk(p,core.RMIN,self.cfg.circle_sides)
+                if reg.empty:break
+            self.unsearched[c]=reg
+            if reg.empty:
+                ch.status='excluded'
+                self.log.write('coverage_excluded',channel=c,negative_count=len(ch.negatives))
+
+    def execute(self,a):
+        print(f"动作 {self.counts['measure']+self.counts['clear']+1}: {a.kind} 频道{a.channel} 位置({a.q[0]:.1f},{a.q[1]:.1f}) [{a.reason}]",flush=True)
+        result=super().execute(a)
+        self.refresh_coverage()
+        return result
+
+    def scan(self,force=False):
+        if force:
+            station=next((j for j,q in enumerate(self.anchors) if core.norm(q-self.p)<1e-5),None)
+            tasks=self.coverage_tasks()
+            required=tasks.get(station,[]) if station is not None else list(self.channels)
+            # 原点是首次全频道扫描；后续固定点只执行仍必要的频道任务。
+            if not self.initial_seen:required=list(self.channels)
+            for c in sorted(required,key=lambda c:(c!=self.h,c)):
+                ch=self.channels[c]
+                if ch.status=='unknown' and not core.same_point(ch.measured,self.p):
+                    self.execute(core.Action('measure',self.p.copy(),c,reason='coverage_scan'))
+                self.update_count_bound()
+        else:super().scan(False)
+        self.refresh_coverage()
+        if force:
+            for j,q in enumerate(self.anchors):
+                if core.norm(q-self.p)<1e-5:self.initial_seen.add(j)
+        # 原点及所有初始站也检查推荐第二点，不设1~2个频道限制。
+        self.share_observation(None)
+
+    def check_work(self):
+        if time.monotonic()>=min(self.work_deadline,self.deadline-self.cfg.reserve_seconds):
+            raise core.PlanningDeadline()
+
+    def predicted_radius(self,ch,q):
+        self.check_work()
+        if core.same_point(ch.measured,q) or not self.planner.certify(ch,q):return math.inf
+        radii=[]
+        for z,theta in self.planner.outcomes(ch,core.Action('measure',q,ch.number)):
+            self.check_work()
+            branch=ch.predicted('measure',q,z,theta,self.cfg)
+            if branch.region is not None and not branch.region.empty:radii.append(branch.region.circle[1])
+        return max(radii,default=math.inf)
+
+    def recommended(self,ch):
+        key=(ch.number,len(ch.measured),len(ch.failed),ch.attempts,tuple(self.p))
+        if key in self.recommendation_cache:return self.recommendation_cache[key]
+        # 在克隆上规划，避免未选择候选提前改变真实源的兜底状态。
+        clone=dataclasses.replace(ch,fallback=None if ch.fallback is None else list(ch.fallback))
+        end=min(self.work_deadline,self.deadline-self.cfg.reserve_seconds,time.monotonic()+self.cfg.recommendation_seconds)
+        action=self.planner.plan(clone,self.p,self.h,end)
+        qs=[np.array(q) for kind,q,score in self.planner.evaluated if kind=='measure']
+        if action.kind=='measure':qs.append(action.q)
+        # 已计划初始/覆盖站必须进入比较，便于站上第二次检测。
+        qs.extend(self.anchors)
+        values=[]
+        for q in qs:
+            if any(core.norm(q-old[1])<1e-5 for old in values):continue
+            if time.monotonic()>=end:break
+            try:value=self.predicted_radius(ch,q)
+            except core.PlanningDeadline:break
+            if math.isfinite(value):values.append((value,q.copy()))
+            if time.monotonic()>=self.deadline-self.cfg.reserve_seconds:break
+        best=min((v for v,q in values),default=math.inf)
+        chosen=[]
+        for value,q in sorted(values,key=lambda item:item[0]):
+            if value>best+self.cfg.delta_rho:continue
+            if all(core.norm(q-old)>25 for old in chosen):chosen.append(q)
+            if len(chosen)>=self.cfg.recommendations:break
+        result=(best,chosen,action)
+        self.recommendation_cache[key]=result
+        if len(self.recommendation_cache)>256:self.recommendation_cache.clear()
+        return result
+
+    def share_observation(self,last_channel):
+        if not self.cfg.shared_detection or self.sharing:return
+        self.sharing=True
+        old_deadline=self.work_deadline
+        self.work_deadline=min(old_deadline,time.monotonic()+self.cfg.station_seconds)
+        print('检查本站补测机会…',flush=True)
+        try:
+            # 同一站逐频道评估；真实执行后重新读取状态，已清除的源直接跳过。
+            for c in sorted(self.channels,key=lambda c:(c!=self.h,c)):
+                ch=self.channels[c]
+                if ch.status!='active' or core.same_point(ch.measured,self.p):continue
+                if time.monotonic()>=self.deadline-self.cfg.reserve_seconds:return
+                if ch.attempts>=self.cfg.max_local or ch.fallback is not None:continue
+                q=core.nearest_clear(ch.region,self.p)
+                if q is not None and core.norm(q-self.p)<1e-5:
+                    self.execute(core.Action('clear',self.p.copy(),c,True,reason='joint_in_place'));continue
+                if q is not None:continue
+                value=self.predicted_radius(ch,self.p)
+                if not math.isfinite(value):continue
+                self.check_work()
+                best,_,_=self.recommended(ch)
+                # 核心条件是推荐区域；跨过清除精度也保留，比例下降只作额外入口。
+                gain=1-value/ch.region.circle[1]
+                if (math.isfinite(best) and value<=best+self.cfg.delta_rho) or value<=core.CLEAR_SAFE or gain>=self.cfg.shared_min_gain:
+                    ch.attempts+=1
+                    self.execute(core.Action('measure',self.p.copy(),c,reason='recommended_station_measure'))
+                    if ch.status=='active' and np.max(np.linalg.norm(ch.region.vertices-self.p,axis=1))<=core.CLEAR_SAFE:
+                        self.execute(core.Action('clear',self.p.copy(),c,True,reason='joint_in_place'))
+        except core.PlanningDeadline:
+            print('本站补测筛选达到计算预算，继续主任务。',flush=True)
+        finally:
+            self.sharing=False
+            self.work_deadline=old_deadline
+
+    def coverage_tasks(self,channels=None):
+        channels=self.channels if channels is None else channels
+        signature=tuple((c,ch.status,tuple(tuple(q) for q in ch.negatives),tuple(sorted(ch.anchors))) for c,ch in channels.items())
+        if signature in self.coverage_cache:return self.coverage_cache[signature]
+        tasks={}
+        for c,ch in channels.items():
+            if ch.status!='unknown':continue
+            channel_key=(tuple(tuple(q) for q in ch.negatives),tuple(sorted(ch.anchors)))
+            if channel_key in self.coverage_channel_cache:
+                for j in self.coverage_channel_cache[channel_key]:tasks.setdefault(j,[]).append(c)
+                continue
+            reg=core.target_region(self.cfg)
+            for old in ch.negatives:
+                reg=reg.subtract_disk(old,core.RMIN,self.cfg.circle_sides)
+                if reg.empty:break
+            if reg.empty:continue
+            keep=[j for j in range(7) if j not in ch.anchors]
+            # 逐个删除，始终用当前保留集合认证；认证失败保留，不根据采样删任务。
+            for j in list(keep):
+                remainder=reg
+                for k in keep:
+                    if k==j:continue
+                    remainder=remainder.subtract_disk(self.anchors[k],core.RMIN,self.cfg.circle_sides)
+                    if remainder.empty:break
+                if remainder.empty:keep.remove(j)
+            self.coverage_channel_cache[channel_key]=keep
+            for j in keep:tasks.setdefault(j,[]).append(c)
+        if len(self.coverage_cache)>128:self.coverage_cache.clear()
+        self.coverage_cache[signature]=tasks
+        return tasks
+
+    def coverage_route(self,p,tasks):
+        ids=list(tasks)
+        if not ids:return [],0.
+        # 至多7点，开放路线精确枚举给定点集的移动顺序。
+        best=None
+        for order in itertools.permutations(ids):
+            points=[p]+[self.anchors[j] for j in order]
+            length=sum(core.norm(b-a) for a,b in zip(points,points[1:]))
+            if best is None or length<best[0]:best=(length,list(order))
+        return best[1],best[0]/core.SPEED
+
+    def old_remaining_cost(self,p,h,channels,tasks):
+        # 共用一条停靠路线。待定位源只使用可执行兜底终端估计，不声称其圆心可清除。
+        active=[ch for ch in channels.values() if ch.status=='active']
+        pos=p.copy();cost=0.; visits=[]
+        while active:
+            ch=min(active,key=lambda x:self.planner.terminal(x,pos))
+            q=core.nearest_clear(ch.region,pos)
+            if q is None:
+                route,t=core.cover_route(ch.region,pos)
+                cost+=t;pos=route[-1].copy()  # 最坏遍历至末点的终点代理
+            else:
+                cost+=core.norm(q-pos)/core.SPEED+5;pos=q.copy()
+                visits.append((ch,q))
+            active.remove(ch)
+        # 目前尾部统一补全覆盖；不重复计入各源独立出发路程。
+        order,movement=self.coverage_route(pos,tasks);cost+=movement
+        for j in order:
+            for c in sorted(tasks[j],key=lambda c:(c!=h,c)):
+                cost+=5+int(c!=h);h=c
+        return cost
+
+    def tail_check(self):
+        if time.monotonic()>=min(self.cost_deadline,self.deadline-self.cfg.reserve_seconds):
+            raise core.PlanningDeadline()
+
+    def nodes_cost(self,nodes,p,h):
+        """一条共享路线；清除位置按相邻访问点重新求解，保留每源前置测向约束。"""
+        total=0.;pos=p.copy()
+        for i,node in enumerate(nodes):
+            self.tail_check()
+            q=node['q']
+            if node['kind']=='clear':
+                region=node['region'];q=core.nearest_clear(region,pos)
+                if i+1<len(nodes):
+                    adjusted=core.forward_clear_point(region,pos,nodes[i+1]['q'])
+                    if adjusted is not None:q=adjusted
+            total+=core.norm(q-pos)/core.SPEED+node['seconds']
+            if node['kind']=='measure':total+=int(h!=node['channel']);h=node['channel']
+            elif node['kind']=='coverage':
+                for c in sorted(node['channels'],key=lambda c:(c!=h,c)):
+                    total+=5+int(h!=c);h=c
+            pos=q
+        return total,pos,h
+
+    def tail_options(self,ch,p,h,depth):
+        self.tail_check()
+        # 精确几何字节与历史进入键；只缓存完整预测，不缓存超时的半成品。
+        key=(ch.number,tuple(poly.tobytes() for poly in ch.region.pieces),
+             tuple(tuple(q) for q in ch.measured),tuple(tuple(q) for q in ch.received),
+             tuple(tuple(q) for q in ch.negatives),tuple(tuple(q) for q in ch.failed),
+             tuple(p),h,depth)
+        if key in self.tail_cache:self.tail_hits+=1;return self.tail_cache[key]
+        self.tail_misses+=1
+        c=ch.number;clear=core.nearest_clear(ch.region,p)
+        if clear is not None:
+            return [[dict(kind='clear',channel=c,q=clear,seconds=5.,region=ch.region)]]
+        if depth<=0:
+            route,_=core.cover_route(ch.region,p)
+            return [[dict(kind='fallback',channel=c,q=q,seconds=5. if i==len(route)-1 else 3.) for i,q in enumerate(route)]]
+        center,radius=ch.region.circle;u=center-p
+        side=np.array([-u[1],u[0]])/max(core.norm(u),1.)
+        proposals=[p.copy()]
+        for scale in (max(100.,min(500.,radius)),):
+            proposals.extend([(p+center)/2+sign*scale*side for sign in (-1,1)])
+        # 不用大面积清除兜底成本排序检测点；先按路程和交会几何粗排。
+        proposals.sort(key=lambda q:core.norm(q-p))
+        options=[]
+        for q in proposals:
+            self.tail_check()
+            if core.same_point(ch.measured,q) or not self.planner.certify(ch,q):continue
+            worst=-math.inf;worst_nodes=None
+            for z,theta in self.planner.outcomes(ch,core.Action('measure',q,c)):
+                self.tail_check()
+                branch=ch.predicted('measure',q,z,theta,self.cfg)
+                if branch.region is None or branch.region.empty:continue
+                first=dict(kind='measure',channel=c,q=q.copy(),seconds=5.)
+                if z=='near':
+                    rest=[dict(kind='clear',channel=c,q=q.copy(),seconds=5.,region=branch.region)]
+                else:
+                    rest=min(self.tail_options(branch,q,c,depth-1),key=lambda path:self.nodes_cost(path,q,c)[0])
+                nodes=[first]+rest;value=self.nodes_cost(nodes,p,h)[0]
+                if value>worst:worst,worst_nodes=value,nodes
+            if worst_nodes is not None:options.append(worst_nodes)
+            if len(options)>=self.cfg.tail_candidates:break
+        if not options:options=self.tail_options(ch,p,h,0)
+        if len(self.tail_cache)>256:self.tail_cache.clear()
+        self.tail_cache[key]=options
+        return options
+
+    def remaining_cost(self,p,h,channels,tasks):
+        if self.cfg.cost_model=='baseline':return self.old_remaining_cost(p,h,channels,tasks)
+        self.tail_check()
+        active=[ch for ch in channels.values() if ch.status=='active']
+        # 粗排遍历全部源，优先近区域；每源只展开少量候选。
+        active.sort(key=lambda ch:max(0.,core.norm(ch.region.circle[0]-p)-ch.region.circle[1]))
+        nodes=[];pos=p.copy();heading=h
+        for ch in active:
+            self.tail_check()
+            options=self.tail_options(ch,pos,heading,self.cfg.tail_depth)
+            if self.cfg.cost_model=='A':
+                chosen=min(options,key=lambda path:self.nodes_cost(path,pos,heading)[0])
+                nodes+=chosen;_,pos,heading=self.nodes_cost(chosen,pos,heading)
+            else:
+                best=None
+                for option in options:
+                    for i in range(len(nodes)+1):
+                        self.tail_check()
+                        trial=nodes[:i]+option+nodes[i:]
+                        value=self.nodes_cost(trial,p,h)[0]
+                        if best is None or value<best[0]:best=(value,trial)
+                nodes=best[1]
+        order,_=self.coverage_route(p,tasks)
+        for j in order:
+            node=dict(kind='coverage',channel=None,q=self.anchors[j],seconds=0.,channels=tasks[j])
+            if self.cfg.cost_model=='A':nodes.append(node)
+            else:
+                best=None
+                for i in range(len(nodes)+1):
+                    self.tail_check();trial=nodes[:i]+[node]+nodes[i:];value=self.nodes_cost(trial,p,h)[0]
+                    if best is None or value<best[0]:best=(value,trial)
+                nodes=best[1]
+        # 可将覆盖/其他源任务插在同源检测和清除之间，但不颠倒同源步骤。
+        if self.cfg.cost_model=='B':
+            for _ in range(self.cfg.insertion_passes):
+                improved=False
+                for index in range(len(nodes)):
+                    self.tail_check();node=nodes[index];rest=nodes[:index]+nodes[index+1:]
+                    same_before=[x for x in nodes[:index] if x['channel']==node['channel'] and node['channel'] is not None]
+                    same_after=[x for x in nodes[index+1:] if x['channel']==node['channel'] and node['channel'] is not None]
+                    low=next((i+1 for i,x in enumerate(rest) if same_before and x is same_before[-1]),0)
+                    high=next((i for i,x in enumerate(rest) if same_after and x is same_after[0]),len(rest))
+                    best=(self.nodes_cost(nodes,p,h)[0],nodes)
+                    for i in range(low,high+1):
+                        self.tail_check();trial=rest[:i]+[node]+rest[i:];value=self.nodes_cost(trial,p,h)[0]
+                        if value<best[0]-1e-6:best=(value,trial);improved=True
+                    nodes=best[1]
+                if not improved:break
+        return self.nodes_cost(nodes,p,h)[0]
+
+    def action_score(self,a,tasks,stop):
+        worst=-math.inf;ch=self.channels[a.channel]
+        for z,theta in self.planner.outcomes(ch,a):
+            if time.monotonic()>=stop:raise core.PlanningDeadline()
+            branch=ch.predicted(a.kind,a.q,z,theta,self.cfg)
+            if branch.region is not None and branch.region.empty:continue
+            channels=dict(self.channels);channels[a.channel]=branch
+            operation=(5+int(a.channel!=self.h)) if a.kind=='measure' else (5 if z=='success' else 3)
+            heading=a.channel if a.kind=='measure' else self.h
+            prefix=core.norm(a.q-self.p)/core.SPEED+operation
+            if z=='near':branch.status='cleared';prefix+=5
+            # 把该停靠点的未知补扫及其无信号分支覆盖收益计入同一成本。
+            # 新源出现无法用固定概率预知：此尾部是近似，不是严格连续最坏保证。
+            predicted_tasks={j:list(cs) for j,cs in tasks.items()}
+            for c,unknown in list(channels.items()):
+                if not self.cfg.supplement or unknown.status!='unknown' or core.same_point(unknown.measured,a.q):continue
+                residual=self.unsearched[c].disk(a.q,core.RMIN,self.cfg.circle_sides)
+                if residual.empty or core.region_area(residual)<self.cfg.scan_min_area:continue
+                prefix+=5+int(c!=heading);heading=c
+                # 只计可选补扫操作成本；未执行前不把假设无信号当成覆盖收益。
+            predicted_tasks=tasks
+            value=prefix+self.remaining_cost(a.q,heading,channels,predicted_tasks)
+            worst=max(worst,value)
+        return worst if math.isfinite(worst) else math.inf
+
+    def choose(self):
+        active=[ch for ch in self.channels.values() if ch.status=='active']
+        for ch in active:
+            if np.max(np.linalg.norm(ch.region.vertices-self.p,axis=1))<=core.CLEAR_SAFE:
+                return core.Action('clear',self.p.copy(),ch.number,True,reason='joint_in_place')
+        tasks=self.coverage_tasks()
+        order,_=self.coverage_route(self.p,tasks)
+        if len(self.initial_seen)<self.cfg.initial_stations and order:
+            j=order[0];return core.Action('measure',self.anchors[j].copy(),tasks[j][0],reason='coverage_anchor')
+        if not active:
+            if not order:raise core.GeometryError('未完成但没有可靠剩余覆盖任务')
+            j=order[0];return core.Action('measure',self.anchors[j].copy(),tasks[j][0],reason='coverage_anchor')
+        print('联合规划：生成候选与剩余任务估价…',flush=True)
+        stop=min(self.deadline-self.cfg.reserve_seconds,time.monotonic()+self.cfg.joint_seconds)
+        selected=sorted(active,key=lambda ch:max(0.,core.norm(ch.region.circle[0]-self.p)-ch.region.circle[1]))[:self.cfg.joint_sources]
+        candidates=[]
+        candidate_end=min(stop,time.monotonic()+self.cfg.joint_seconds*.3)
+        for ch in selected:
+            self.work_deadline=candidate_end
+            try:_,qs,fallback=self.recommended(ch)
+            finally:self.work_deadline=math.inf
+            candidates.append(fallback)
+            if fallback.guaranteed and order:
+                adjusted=core.forward_clear_point(ch.region,self.p,self.anchors[order[0]])
+                if adjusted is not None:
+                    candidates.append(core.Action('clear',adjusted,ch.number,True,reason='joint_clear_region'))
+            candidates.extend(core.Action('measure',q,ch.number,reason='joint_recommended') for q in qs)
+            if time.monotonic()>=candidate_end:break
+        # 至少有原局部规划给出的可执行动作；未完整评分的动作不参与排名。
+        best=candidates[0];score=math.inf
+        self.cost_deadline=stop
+        # 保留继续覆盖的竞争方案，避免只因已有源就无限推迟未知频道。
+        if order and time.monotonic()<stop:
+            j=order[0];q=self.anchors[j]
+            channels=dict(self.channels);heading=self.h
+            prefix=core.norm(q-self.p)/core.SPEED
+            for c in sorted(tasks[j],key=lambda c:(c!=heading,c)):
+                prefix+=5+int(c!=heading);heading=c
+                channels[c]=channels[c].predicted('measure',q,'no_signal',None,self.cfg)
+            tail=self.coverage_tasks(channels)
+            try:coverage_score=prefix+self.remaining_cost(q,heading,channels,tail)
+            except core.PlanningDeadline:coverage_score=math.inf
+            if math.isfinite(coverage_score):score=coverage_score
+            if math.isfinite(coverage_score):best=core.Action('measure',q.copy(),tasks[j][0],reason='coverage_anchor')
+        for action in candidates[:self.cfg.joint_actions]:
+            try:value=self.action_score(action,tasks,stop)
+            except core.PlanningDeadline:break
+            if value<score:best,score=action,value
+        self.current=best.channel
+        if self.channels[best.channel].status=='active':self.channels[best.channel].attempts+=1
+        self.log.write('joint_plan',channel=best.channel,kind=best.kind,score=None if not math.isfinite(score) else score,
+                       candidate_count=len(candidates),coverage_order=order,approximate=True,cost_model=self.cfg.cost_model,tail_cache_hits=self.tail_hits,tail_cache_misses=self.tail_misses)
+        return best
+
+def main():
+    p=core.parser()
+    p.description=__doc__
+    p.set_defaults(**{f.name:getattr(Config(),f.name) for f in dataclasses.fields(Config)})
+    for name in ['initial_stations','recommendations','joint_sources','joint_actions','tail_depth','tail_candidates','insertion_passes']:
+        p.add_argument('--'+name.replace('_','-'),type=int,default=getattr(Config(),name))
+    for name in ['delta_rho','joint_seconds','shared_min_gain','station_seconds','recommendation_seconds']:
+        p.add_argument('--'+name.replace('_','-'),type=float,default=getattr(Config(),name))
+    p.add_argument('--no-shared-detection',dest='shared_detection',action='store_false')
+    p.add_argument('--cost-model',choices=['baseline','A','B'],default='B')
+    args=p.parse_args();cfg=Config()
+    for f in dataclasses.fields(cfg):
+        if hasattr(args,f.name):setattr(cfg,f.name,getattr(args,f.name))
+    cfg.supplement=not args.no_supplement
+    if args.mode=='official' and not args.robot_id:p.error('官方模式需要robot-id')
+    if not 1<=cfg.initial_stations<=7 or min(cfg.recommendations,cfg.joint_sources,cfg.joint_actions)<1:p.error('初始站1至7，候选数量须为正')
+    if not 1123<=cfg.ring<=1732 or cfg.grid<3 or cfg.observations<3 or cfg.circle_sides<16 or cfg.source_samples<3:p.error('几何参数范围错误')
+    if cfg.depth not in (1,2) or cfg.score_limit<0 or cfg.max_local<0 or cfg.refine<0 or min(cfg.regions,cfg.beam,cfg.max_actions)<1:p.error('规划整数参数范围错误')
+    if not all(math.isfinite(v) and v>=0 for v in [cfg.delta_rho,cfg.scan_min_area,cfg.switch_margin,cfg.shared_min_gain]) or cfg.shared_min_gain>1:p.error('容差及门槛参数错误')
+    if not all(math.isfinite(v) and v>0 for v in [cfg.joint_seconds,cfg.decision_seconds,cfg.station_seconds,cfg.recommendation_seconds,args.timeout]) or cfg.reserve_seconds<5 or not math.isfinite(cfg.reserve_seconds) or args.retries<0:p.error('时间或重试参数错误')
+    if cfg.tail_depth not in (1,2) or cfg.tail_candidates<1 or cfg.insertion_passes<0:p.error('tail-depth为1或2，tail-candidates正，insertion-passes非负')
+    team=args.robot_id or 'LOCAL'
+    if not 1<=len(team.encode('utf-8'))<=64 or any(core.unicodedata.category(c).startswith('C') for c in team):p.error('队号格式错误')
+    directory=args.output or str(Path('output')/('problem_3_cost_'+time.strftime('%Y%m%d_%H%M%S')+'_'+uuid.uuid4().hex[:6]))
+    log=core.Journal(directory)
+    sim=core.LocalSimulator(args.seed,team,args.count) if args.mode=='local' else core.HTTPTransport(args.base_url,args.timeout,args.retries,log)
+    robot=JointRobot(cfg,sim,team,log)
+    print(f"启动联合版：模式={args.mode}，日志={log.directory.resolve()}，站上筛选预算={cfg.station_seconds:g}s，联合预算={cfg.joint_seconds:g}s",flush=True)
+    result=robot.run()
+    if args.mode=='local':
+        actual=sum(s['cleared'] for s in sim.sources.values())
+        evaluation={'source_count':len(sim.sources),'actual_cleared':actual,'clear_fraction':actual/len(sim.sources),'seed':args.seed}
+        (log.directory/'local_evaluation.json').write_text(json.dumps(evaluation,indent=2),encoding='utf-8')
+        print(json.dumps(evaluation))
+    print(json.dumps(result,ensure_ascii=False,indent=2));log.file.close()
+    return 0 if result['all_cleared'] else 1
+if __name__=='__main__':raise SystemExit(main())
